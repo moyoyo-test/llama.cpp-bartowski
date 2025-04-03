@@ -765,8 +765,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
-    GGML_ASSERT(qs.n_ffn_down_exp != 0);
-
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
 
     // sanity checks for models that have attention layers
