@@ -7,6 +7,7 @@
 #include <cassert>
 #include <vector>
 #include <set>
+#include <map>
 
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
@@ -23,7 +24,7 @@ public:
 
         used.clear();
 
-        for (uint32_t s = 0; s < LLAMA_MAX_PARALLEL_SEQUENCES; ++s) {
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
     }
@@ -68,12 +69,6 @@ public:
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
-#if 0
-        if (!seq_pos[0].empty()) printf("kv_cells: min[0] = %5d, max[0] = %5d\n", *seq_pos[0].begin(), *seq_pos[0].rbegin());
-        if (!seq_pos[1].empty()) printf("kv_cells: min[1] = %5d, max[1] = %5d\n", *seq_pos[1].begin(), *seq_pos[1].rbegin());
-        if (!seq_pos[2].empty()) printf("kv_cells: min[2] = %5d, max[2] = %5d\n", *seq_pos[2].begin(), *seq_pos[2].rbegin());
-#endif
-
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
 
@@ -85,6 +80,9 @@ public:
     void mv(uint32_t isrc, uint32_t idst) {
         assert(isrc < pos.size());
         assert(idst < pos.size());
+
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
 
         pos  [idst] = pos  [isrc];
         shift[idst] = shift[isrc];
@@ -144,6 +142,20 @@ public:
         }
     }
 
+    // clear a non-empty cell
+    void rm(uint32_t i) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        seq_pos_rm(i);
+        seq[i].reset();
+
+        pos[i] = -1;
+        shift[i] = 0;
+
+        used.erase(i);
+    }
+
     // note: call only if the cell has seq_id
     // return true if the cell becomes empty
     bool seq_rm(uint32_t i, llama_seq_id seq_id) {
@@ -153,10 +165,11 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
-        seq_pos[seq_id].erase(pos[i]);
+        seq_pos_dec(seq_id, pos[i]);
 
         if (seq[i].none()) {
             pos[i] = -1;
+            shift[i] = 0;
 
             used.erase(i);
 
@@ -175,7 +188,7 @@ public:
             seq[i].reset();
 
             seq[i].set(seq_id);
-            seq_pos[seq_id].insert(pos[i]);
+            seq_pos_inc(seq_id, pos[i]);
 
             return false;
         }
@@ -185,6 +198,7 @@ public:
             seq[i].reset();
 
             pos[i] = -1;
+            shift[i] = 0;
 
             used.erase(i);
 
@@ -196,6 +210,15 @@ public:
         return false;
     }
 
+    // number of different sequences in the cell
+    int seq_count(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        return seq[i].count();
+    }
+
+    // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
         assert(seq_id >= 0);
@@ -210,33 +233,51 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
-        seq_pos[seq_id].insert(pos[i]);
+        seq_pos_inc(seq_id, pos[i]);
+    }
+
+    // return the sequence id of this cell
+    // note: call only for cells with exactly one sequence
+    llama_seq_id seq_get(uint32_t i) const {
+        assert(seq[i].count() == 1);
+
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq[i].test(s)) {
+                return s;
+            }
+        }
+
+        return -1;
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
-        assert(seq_id < LLAMA_MAX_PARALLEL_SEQUENCES);
+        assert(seq_id < LLAMA_MAX_SEQ);
 
         if (seq_pos[seq_id].empty()) {
             return -1;
         }
 
-        return *seq_pos[seq_id].begin();
+        assert(seq_pos[seq_id].begin()->second > 0);
+
+        return seq_pos[seq_id].begin()->first;
     }
 
     // the maximum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_max(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
-        assert(seq_id < LLAMA_MAX_PARALLEL_SEQUENCES);
+        assert(seq_id < LLAMA_MAX_SEQ);
 
         if (seq_pos[seq_id].empty()) {
             return -1;
         }
 
-        return *seq_pos[seq_id].rbegin();
+        assert(seq_pos[seq_id].rbegin()->second > 0);
+
+        return seq_pos[seq_id].rbegin()->first;
     }
 
     // note: call only if the cell is not empty
@@ -268,6 +309,7 @@ public:
     void pos_set(uint32_t i, llama_pos p) {
         assert(i < pos.size());
         assert(pos[i] == -1);
+        assert(seq[i].none());
 
         pos[i] = p;
 
@@ -286,20 +328,19 @@ public:
         pos[i]   += d;
         shift[i] += d;
 
-        seq_pos_add(i);
-
         has_shift = true;
 
         if (pos[i] < 0) {
-            seq_pos_rm(i);
-
             seq[i].reset();
             pos[i] = -1;
+            shift[i] = 0;
 
             used.erase(i);
 
             return true;
         }
+
+        seq_pos_add(i);
 
         return false;
     }
@@ -348,31 +389,50 @@ private:
     //
     std::vector<llama_pos> shift;
 
-    using bits_t = std::bitset<LLAMA_MAX_PARALLEL_SEQUENCES>;
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
-    std::vector<bits_t> seq;
+    std::vector<seq_set_t> seq;
 
-    // the set seq_pos[s] tells us which positions are currently present for sequence s
+    // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
+    // if the position p is not present, seq_pos[s][p] is not set
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
-    std::set<llama_pos> seq_pos[LLAMA_MAX_PARALLEL_SEQUENCES];
+    //
+    // note that we cannot a use an std::set because in some cases a position can occur more than once for the same seq:
+    //  - during performing a cache reuse via (rm + add)
+    //  - some vision models have input embeddings with repeating positions
+    //
+    std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
+    void seq_pos_dec(llama_seq_id s, llama_pos p) {
+        auto it = seq_pos[s].find(p);
+        assert(it != seq_pos[s].end());
+
+        if (--it->second == 0) {
+            seq_pos[s].erase(it);
+        }
+    }
+
+    void seq_pos_inc(llama_seq_id s, llama_pos p) {
+        seq_pos[s][p]++;
+    }
+
     // remove cell i
     void seq_pos_rm(uint32_t i) {
-        for (int s = 0; s < LLAMA_MAX_PARALLEL_SEQUENCES; ++s) {
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos[s].erase(pos[i]);
+                seq_pos_dec(s, pos[i]);
             }
         }
     }
 
     // add cell i
     void seq_pos_add(uint32_t i) {
-        for (int s = 0; s < LLAMA_MAX_PARALLEL_SEQUENCES; ++s) {
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos[s].insert(pos[i]);
+                seq_pos_inc(s, pos[i]);
             }
         }
     }

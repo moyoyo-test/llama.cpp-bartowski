@@ -1,12 +1,13 @@
 #include "chat.h"
 #include "chat-parser.h"
 #include "common.h"
+#include "json-partial.h"
 #include "json-schema-to-grammar.h"
 #include "log.h"
-#include "json-partial.h"
-#include "minja/chat-template.hpp"
-#include "minja/minja.hpp"
 #include "regex-partial.h"
+
+#include <minja/chat-template.hpp>
+#include <minja/minja.hpp>
 
 #include <cstdio>
 #include <exception>
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 
+using json = nlohmann::ordered_json;
 
 static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -82,10 +84,10 @@ json common_chat_msg::to_json_oaicompat() const
 
 std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const common_chat_msg & previous_msg, const common_chat_msg & new_msg) {
     std::vector<common_chat_msg_diff> diffs;
-    // if (previous_msg.reasoning_content != current.reasoning_content) {
-    //     auto & diff = diffs.emplace_back();
-    //     diff.reasoning_content_delta = string_diff(previous_msg.reasoning_content, current.reasoning_content);
-    // }
+    if (previous_msg.reasoning_content != new_msg.reasoning_content) {
+        auto & diff = diffs.emplace_back();
+        diff.reasoning_content_delta = string_diff(previous_msg.reasoning_content, new_msg.reasoning_content);
+    }
     if (previous_msg.content != new_msg.content) {
         auto & diff = diffs.emplace_back();
         diff.content_delta = string_diff(previous_msg.content, new_msg.content);
@@ -140,6 +142,7 @@ struct templates_params {
     bool add_generation_prompt = true;
     bool enable_thinking = true;
     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+    json extra_context;
 };
 
 common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::string & tool_choice) {
@@ -385,9 +388,9 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
 
 template <> json common_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
     json delta = json::object();
-    // if (!diff.reasoning_content_delta.empty()) {
-    //     delta["reasoning_content"] = msg.reasoning_content;
-    // }
+    if (!diff.reasoning_content_delta.empty()) {
+        delta["reasoning_content"] = diff.reasoning_content_delta;
+    }
     if (!diff.content_delta.empty()) {
         delta["content"] = diff.content_delta;
     }
@@ -598,6 +601,7 @@ const char * common_reasoning_format_name(common_reasoning_format format) {
     switch (format) {
         case COMMON_REASONING_FORMAT_NONE:     return "none";
         case COMMON_REASONING_FORMAT_DEEPSEEK: return "deepseek";
+        case COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY: return "deepseek-legacy";
         default:
             throw std::runtime_error("Unknown reasoning format");
     }
@@ -719,16 +723,23 @@ static void foreach_function(const json & tools, const std::function<void(const 
 
 static std::string apply(
     const common_chat_template & tmpl,
-    const nlohmann::ordered_json & messages,
-    const nlohmann::ordered_json & tools,
-    bool add_generation_prompt,
-    const nlohmann::ordered_json & extra_context = nlohmann::ordered_json())
+    const struct templates_params & inputs,
+    const std::optional<json> & messages_override = std::nullopt,
+    const std::optional<json> & tools_override = std::nullopt,
+    const std::optional<json> & additional_context = std::nullopt)
 {
     minja::chat_template_inputs tmpl_inputs;
-    tmpl_inputs.messages = messages;
-    tmpl_inputs.tools = tools;
-    tmpl_inputs.add_generation_prompt = add_generation_prompt;
-    tmpl_inputs.extra_context = extra_context;
+    tmpl_inputs.messages = messages_override ? *messages_override : inputs.messages;
+    if (tools_override) {
+        tmpl_inputs.tools = *tools_override;
+    } else {
+        tmpl_inputs.tools = inputs.tools.empty() ? json() : inputs.tools;
+    }
+    tmpl_inputs.add_generation_prompt = inputs.add_generation_prompt;
+    tmpl_inputs.extra_context = inputs.extra_context;
+    if (additional_context) {
+        tmpl_inputs.extra_context.merge_patch(*additional_context);
+    }
     // TODO: add flag to control date/time, if only for testing purposes.
     // tmpl_inputs.now = std::chrono::system_clock::now();
 
@@ -827,7 +838,7 @@ static common_chat_params common_chat_params_init_generic(const common_chat_temp
         inputs.messages,
         "Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request");
 
-    data.prompt = apply(tmpl, tweaked_messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    data.prompt = apply(tmpl, inputs, /* messages_override= */ tweaked_messages);
     data.format = COMMON_CHAT_FORMAT_GENERIC;
     return data;
 }
@@ -903,7 +914,7 @@ static common_chat_params common_chat_params_init_mistral_nemo(const common_chat
     data.preserved_tokens = {
         "[TOOL_CALLS]",
     };
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    data.prompt = apply(tmpl, inputs);
     data.format = COMMON_CHAT_FORMAT_MISTRAL_NEMO;
     return data;
 }
@@ -933,7 +944,7 @@ static common_chat_params common_chat_params_init_command_r7b(const common_chat_
             adjusted_messages.push_back(msg);
         }
     }
-    data.prompt = apply(tmpl, adjusted_messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt, {});
+    data.prompt = apply(tmpl, inputs, /* messages_override= */ adjusted_messages);
     data.format = COMMON_CHAT_FORMAT_COMMAND_R7B;
     if (string_ends_with(data.prompt, "<|START_THINKING|>")) {
         if (!inputs.enable_thinking) {
@@ -1121,7 +1132,7 @@ static common_chat_params common_chat_params_init_llama_3_x(const common_chat_te
     } else {
         data.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
     }
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt, {
+    data.prompt = apply(tmpl, inputs, /* messages_override =*/ std::nullopt, /* tools_override= */ std::nullopt, json {
         {"date_string", format_time(inputs.now, "%d %b %Y")},
         {"tools_in_user_message", false},
         {"builtin_tools", builtin_tools.empty() ? json() : builtin_tools},
@@ -1186,7 +1197,7 @@ static void common_chat_parse_llama_3_1(common_chat_msg_parser & builder, bool w
 
 static common_chat_params common_chat_params_init_deepseek_r1(const common_chat_template & tmpl, const struct templates_params & inputs) {
     common_chat_params data;
-    auto prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    auto prompt = apply(tmpl, inputs);
 
     // Hacks to fix the official (broken) prompt.
     // It is advisable to use --chat-template-file models/templates/llama-cpp-deepseek-r1.jinja instead,
@@ -1281,7 +1292,7 @@ static void common_chat_parse_deepseek_r1(common_chat_msg_parser & builder) {
 static common_chat_params common_chat_params_init_firefunction_v2(const common_chat_template & tmpl, const struct templates_params & inputs) {
     LOG_DBG("%s\n", __func__);
     common_chat_params data;
-    data.prompt = apply(tmpl, inputs.messages, /* tools= */ nullptr, inputs.add_generation_prompt, {
+    data.prompt = apply(tmpl, inputs, /* messages_override =*/ std::nullopt, /* tools_override= */ json(), json {
         {"datetime", format_time(inputs.now, "%b %d %Y %H:%M:%S GMT")},
         {"functions", json(inputs.tools.empty() ? "" : inputs.tools.dump(2))},
     });
@@ -1337,7 +1348,7 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
     // Using ">>>f1\n", ">>>f2\n"... as trigger words for the grammar
     // If the function is python, we also allow raw python code (if the line after `python\n` doesn't start w/ opening `{`), which the model seems to prefer for multiline code.
     common_chat_params data;
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    data.prompt = apply(tmpl, inputs);
     data.format = COMMON_CHAT_FORMAT_FUNCTIONARY_V3_2;
     if (inputs.tools.is_array() && !inputs.tools.empty()) {
         data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
@@ -1464,7 +1475,7 @@ static common_chat_params common_chat_params_init_functionary_v3_1_llama_3_1(con
         data.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
     }
 
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    data.prompt = apply(tmpl, inputs);
     // TODO: if (has_raw_python)
     return data;
 }
@@ -1497,14 +1508,15 @@ static void common_chat_parse_functionary_v3_1_llama_3_1(common_chat_msg_parser 
 static common_chat_params common_chat_params_init_hermes_2_pro(const common_chat_template & tmpl, const struct templates_params & inputs) {
     common_chat_params data;
 
-    json additional_context = {
+    json extra_context = json {
         {"enable_thinking", inputs.enable_thinking},
     };
+    extra_context.update(inputs.extra_context);
 
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt, additional_context);
+    data.prompt = apply(tmpl, inputs, /* messages_override =*/ std::nullopt, /* tools_override= */ std::nullopt, extra_context);
     data.format = COMMON_CHAT_FORMAT_HERMES_2_PRO;
     if (string_ends_with(data.prompt, "<think>\n")) {
-        if (!inputs.enable_thinking) {
+        if (!extra_context["enable_thinking"]) {
             data.prompt += "</think>";
         } else {
             data.thinking_forced_open = true;
@@ -1690,7 +1702,7 @@ static void common_chat_parse_hermes_2_pro(common_chat_msg_parser & builder) {
 
 static common_chat_params common_chat_params_init_without_tools(const common_chat_template & tmpl, const struct templates_params & inputs) {
     common_chat_params data;
-    data.prompt = apply(tmpl, inputs.messages, inputs.tools.empty() ? json() : inputs.tools, inputs.add_generation_prompt);
+    data.prompt = apply(tmpl, inputs);
     data.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
     data.grammar_lazy = false;
     if (!inputs.json_schema.is_null()) {
@@ -1721,6 +1733,12 @@ static common_chat_params common_chat_templates_apply_jinja(
     params.enable_thinking = inputs.enable_thinking;
     params.grammar = inputs.grammar;
     params.now = inputs.now;
+
+    params.extra_context = json::object();
+    for (auto el : inputs.chat_template_kwargs) {
+        params.extra_context[el.first] = json::parse(el.second);
+    }
+
     if (!inputs.json_schema.empty()) {
         params.json_schema = json::parse(inputs.json_schema);
     }
@@ -1837,7 +1855,7 @@ static common_chat_params common_chat_templates_apply_legacy(
     if (res < 0) {
         // if the custom "tmpl" is not supported, we throw an error
         // this is a bit redundant (for good), since we're not sure if user validated the custom template with llama_chat_verify_template()
-        throw std::runtime_error("this custom template is not supported");
+        throw std::runtime_error("this custom template is not supported, try using --jinja");
     }
 
     // if it turns out that our buffer is too small, we resize it
@@ -1920,7 +1938,9 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
     } catch (const common_chat_msg_partial_exception & ex) {
         LOG_DBG("Partial parse: %s\n", ex.what());
         if (!is_partial) {
-            throw std::runtime_error(ex.what());
+            builder.clear_tools();
+            builder.move_to(0);
+            common_chat_parse_content_only(builder);
         }
     }
     auto msg = builder.result();
